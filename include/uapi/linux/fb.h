@@ -36,6 +36,12 @@
 #define FBIOGET_DISPINFO        0x4618
 #define FBIO_WAITFORVSYNC	_IOW('F', 0x20, __u32)
 
+#define FBIOWAITRETRACE         0x4619
+#define FBIOWAITPEFINISH        0x4620
+#define FBIOVIRTTOPHYS          0x4621
+#define FBIOFLIP                0x4622
+#define FBIOFLIPHACK            0x4623 /* libsdl */
+
 #define FB_TYPE_PACKED_PIXELS		0	/* Packed Pixels	*/
 #define FB_TYPE_PLANES			1	/* Non interleaved planes */
 #define FB_TYPE_INTERLEAVED_PLANES	2	/* Interleaved planes	*/
