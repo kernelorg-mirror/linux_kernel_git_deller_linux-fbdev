@@ -20,6 +20,8 @@
 #define SSD1307FB_DATA			0x40
 #define SSD1307FB_COMMAND		0x80
 
+#define SSD1307FB_PAGE_COL_START_LOW	0x00
+#define SSD1307FB_PAGE_COL_START_HIGH	0x10
 #define SSD1307FB_SET_ADDRESS_MODE	0x20
 #define SSD1307FB_SET_ADDRESS_MODE_HORIZONTAL	(0x00)
 #define SSD1307FB_SET_ADDRESS_MODE_VERTICAL	(0x01)
@@ -54,9 +56,11 @@ struct ssd1307fb_deviceinfo {
 	u32 default_dclk_frq;
 	bool need_pwm;
 	bool need_chargepump;
+	bool page_mode_only;
 };
 
 struct ssd1307fb_par {
+	unsigned page_address_mode : 1;
 	unsigned area_color_enable : 1;
 	unsigned com_invdir : 1;
 	unsigned com_lrremap : 1;
@@ -209,6 +213,34 @@ static int ssd1307fb_set_page_range(struct ssd1307fb_par *par, u8 page_start,
 	return 0;
 }
 
+static int ssd1307fb_set_page_pos(struct ssd1307fb_par *par, u8 page_start,
+				  u8 col_start)
+{
+	int ret;
+	u8 page;
+	u8 col_low;
+	u8 col_high;
+
+	page = SSD1307FB_START_PAGE_ADDRESS | (page_start & 0x0f);
+	col_low = SSD1307FB_PAGE_COL_START_LOW | (col_start & 0x0f);
+	col_high = SSD1307FB_PAGE_COL_START_HIGH |
+		((col_start >> 4) & 0x0f);
+
+	ret = ssd1307fb_write_cmd(par->client, page);
+	if (ret < 0)
+		return ret;
+
+	ret = ssd1307fb_write_cmd(par->client, col_low);
+	if (ret < 0)
+		return ret;
+
+	ret = ssd1307fb_write_cmd(par->client, col_high);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
 static int ssd1307fb_update_rect(struct ssd1307fb_par *par, unsigned int x,
 				 unsigned int y, unsigned int width,
 				 unsigned int height)
@@ -253,13 +285,15 @@ static int ssd1307fb_update_rect(struct ssd1307fb_par *par, unsigned int x,
 	 *  (5) A4 B4 C4 D4 E4 F4 G4 H4
 	 */
 
-	ret = ssd1307fb_set_col_range(par, par->col_offset + x, width);
-	if (ret < 0)
-		goto out_free;
+	if (!par->page_address_mode) {
+		ret = ssd1307fb_set_col_range(par, par->col_offset + x, width);
+		if (ret < 0)
+			goto out_free;
 
-	ret = ssd1307fb_set_page_range(par, par->page_offset + y / 8, pages);
-	if (ret < 0)
-		goto out_free;
+		ret = ssd1307fb_set_page_range(par, par->page_offset + y / 8, pages);
+		if (ret < 0)
+			goto out_free;
+	}
 
 	for (i = y / 8; i < y / 8 + pages; i++) {
 		int m = 8;
@@ -274,13 +308,28 @@ static int ssd1307fb_update_rect(struct ssd1307fb_par *par, unsigned int x,
 				u8 byte = vmem[(8 * i + k) * line_length +
 					       j / 8];
 				u8 bit = (byte >> (j % 8)) & 1;
+
 				data |= bit << k;
 			}
 			array->data[array_idx++] = data;
 		}
+
+		if (par->page_address_mode) {
+			ret = ssd1307fb_set_page_pos(par, par->page_offset + i,
+						     par->col_offset + x);
+			if (ret < 0)
+				goto out_free;
+
+			ret = ssd1307fb_write_array(par->client, array, width);
+			if (ret < 0)
+				goto out_free;
+
+			array_idx = 0;
+		}
 	}
 
-	ret = ssd1307fb_write_array(par->client, array, width * pages);
+	if (!par->page_address_mode)
+		ret = ssd1307fb_write_array(par->client, array, width * pages);
 
 out_free:
 	kfree(array);
@@ -483,13 +532,17 @@ static int ssd1307fb_init(struct ssd1307fb_par *par)
 		}
 	}
 
-	/* Switch to horizontal addressing mode */
+	/* Switch to addressing mode */
 	ret = ssd1307fb_write_cmd(par->client, SSD1307FB_SET_ADDRESS_MODE);
 	if (ret < 0)
 		return ret;
 
-	ret = ssd1307fb_write_cmd(par->client,
-				  SSD1307FB_SET_ADDRESS_MODE_HORIZONTAL);
+	if (par->page_address_mode)
+		ret = ssd1307fb_write_cmd(par->client,
+					  SSD1307FB_SET_ADDRESS_MODE_PAGE);
+	else
+		ret = ssd1307fb_write_cmd(par->client,
+					  SSD1307FB_SET_ADDRESS_MODE_HORIZONTAL);
 	if (ret < 0)
 		return ret;
 
@@ -562,6 +615,13 @@ static struct ssd1307fb_deviceinfo ssd1307fb_ssd1309_deviceinfo = {
 	.default_dclk_frq = 10,
 };
 
+static struct ssd1307fb_deviceinfo ssd1307fb_sh1107_deviceinfo = {
+	.default_vcomh = 0x35,
+	.default_dclk_div = 1,
+	.default_dclk_frq = 8,
+	.page_mode_only = 1,
+};
+
 static const struct of_device_id ssd1307fb_of_match[] = {
 	{
 		.compatible = "solomon,ssd1305fb-i2c",
@@ -578,6 +638,10 @@ static const struct of_device_id ssd1307fb_of_match[] = {
 	{
 		.compatible = "solomon,ssd1309fb-i2c",
 		.data = (void *)&ssd1307fb_ssd1309_deviceinfo,
+	},
+	{
+		.compatible = "sinowealth,sh1107",
+		.data = (void *)&ssd1307fb_sh1107_deviceinfo,
 	},
 	{},
 };
@@ -658,6 +722,7 @@ static int ssd1307fb_probe(struct i2c_client *client)
 
 	par->contrast = 127;
 	par->vcomh = par->device_info->default_vcomh;
+	par->page_address_mode = par->device_info->page_mode_only;
 
 	/* Setup display timing */
 	if (device_property_read_u32(dev, "solomon,dclk-div", &par->dclk_div))
@@ -678,7 +743,6 @@ static int ssd1307fb_probe(struct i2c_client *client)
 	ssd1307fb_defio = devm_kzalloc(dev, sizeof(*ssd1307fb_defio),
 				       GFP_KERNEL);
 	if (!ssd1307fb_defio) {
-		dev_err(dev, "Couldn't allocate deferred io.\n");
 		ret = -ENOMEM;
 		goto fb_defio_error;
 	}
@@ -788,6 +852,7 @@ static const struct i2c_device_id ssd1307fb_i2c_id[] = {
 	{ .name = "ssd1306fb" },
 	{ .name = "ssd1307fb" },
 	{ .name = "ssd1309fb" },
+	{ .name = "sh1107fb" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, ssd1307fb_i2c_id);
